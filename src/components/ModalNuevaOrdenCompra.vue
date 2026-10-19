@@ -1,0 +1,294 @@
+<script setup lang="ts">
+import { vTextoLimpio } from '../directives/textoLimpio'
+import { computed, ref, watch } from 'vue'
+import { CANTIDAD_MAXIMA, importeValido } from '../utils/validacionesCompras'
+import { type OrdenCompraAPI, precioCompraProveedor } from '../services/comprasService'
+import type { Proveedor } from '../types/proveedor'
+import type { ProductoProveedor } from '../services/productosService'
+import type { NuevaOrdenCompra, NuevoOrdenCompraDetalle } from '../types/compra'
+
+interface Props {
+  ordenAEditar?: OrdenCompraAPI | null
+  mostrar: boolean
+  guardando: boolean
+  error: string
+  proveedores: Proveedor[]
+  productos: ProductoProveedor[]
+}
+
+const props = defineProps<Props>()
+const emit = defineEmits<{
+  (e: 'cerrar'): void
+  (e: 'guardar', orden: NuevaOrdenCompra): void
+}>()
+
+const proveedorId = ref<number | ''>('')
+const proveedorSeleccionado = computed(() => props.proveedores.some(proveedor => proveedor.proveedor_id === proveedorId.value))
+
+const productosDisponibles = computed(() => {
+  const proveedor = props.proveedores.find(p => p.proveedor_id === proveedorId.value)
+  if (!proveedor) return []
+  return props.productos.filter(p => proveedor.productos.includes(p.id)).map(p => ({ producto_id: p.id, nombre: p.nombre, preciounitario: precioCompraProveedor(proveedor, p) }))
+})
+const busquedaProveedor = ref('')
+function obtenerFechaActual() {
+  const hoy = new Date()
+  return `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, '0')}-${String(hoy.getDate()).padStart(2, '0')}`
+}
+
+const fecha = ref(obtenerFechaActual())
+let siguienteClave = 1
+const items = ref<(NuevoOrdenCompraDetalle & { clave: number; busqueda: string })[]>([])
+const errorValidacion = ref('')
+const moneda = (valor: number) => Number.isFinite(valor) ? valor.toLocaleString('es-AR', { style: 'currency', currency: 'ARS' }) : 'Sin precio de compra'
+const subtotal = (item: NuevoOrdenCompraDetalle) => Math.round(item.cantidad * item.preciounitario * 100) / 100
+const total = computed(() => Math.round(items.value.reduce((suma, item) => suma + subtotal(item), 0) * 100) / 100)
+
+function normalizarBusqueda(texto: string) {
+  return texto.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim()
+}
+
+const proveedoresFiltrados = computed(() => {
+  const busqueda = normalizarBusqueda(busquedaProveedor.value)
+  const cuitSinSeparadores = busqueda.replace(/[-\s]/g, '')
+
+  return props.proveedores.filter(proveedor =>
+    normalizarBusqueda(`${proveedor.nombre} ${proveedor.apellido}`).includes(busqueda) ||
+    proveedor.proveedor_id.toString().includes(busqueda) ||
+    (cuitSinSeparadores !== '' && proveedor.cuit.replace(/[-\s]/g, '').includes(cuitSinSeparadores))
+  )
+})
+
+const proveedorFueraDelFiltro = computed(() => props.proveedores.find(proveedor =>
+  proveedor.proveedor_id === proveedorId.value &&
+  !proveedoresFiltrados.value.some(coincidencia => coincidencia.proveedor_id === proveedor.proveedor_id)
+))
+
+const productosPorItem = computed(() => items.value.map(item => {
+  const busqueda = normalizarBusqueda(item.busqueda)
+  const coincidencias = productosDisponibles.value.filter(producto =>
+    !items.value.some(otro => otro.clave !== item.clave && otro.producto_id === producto.producto_id) &&
+    (normalizarBusqueda(producto.nombre).includes(busqueda) ||
+    producto.producto_id.toString().includes(busqueda))
+  )
+  const seleccionadoFueraDelFiltro = productosDisponibles.value.find(producto =>
+    producto.producto_id === item.producto_id &&
+    !coincidencias.some(coincidencia => coincidencia.producto_id === producto.producto_id)
+  )
+  return { coincidencias, seleccionadoFueraDelFiltro }
+}))
+
+function agregarItem() {
+  if (!proveedorSeleccionado.value || items.value.length >= productosDisponibles.value.length) return
+  items.value.push({ clave: siguienteClave++, busqueda: '', producto_id: 0, cantidad: 1, preciounitario: 0 })
+}
+
+function actualizarPrecio(item: NuevoOrdenCompraDetalle) {
+  item.preciounitario = productosDisponibles.value.find(producto => producto.producto_id === item.producto_id)?.preciounitario ?? 0
+}
+
+function bloquearCantidadNoEntera(evento: InputEvent) {
+  if (evento.data && /\D/.test(evento.data)) evento.preventDefault()
+}
+
+function validarPegadoCantidad(evento: ClipboardEvent) {
+  const texto = evento.clipboardData?.getData('text') ?? ''
+  if (!/^\d+$/.test(texto)) evento.preventDefault()
+}
+
+function actualizarCantidad(evento: Event, item: NuevoOrdenCompraDetalle) {
+  const campo = evento.target as HTMLInputElement
+  const texto = campo.value
+  const cantidad = Number(texto)
+  if (!/^\d*$/.test(texto) || !Number.isSafeInteger(cantidad) || cantidad > CANTIDAD_MAXIMA) {
+    campo.value = item.cantidad ? String(item.cantidad) : ''
+    return
+  }
+  item.cantidad = cantidad
+}
+
+function guardar() {
+  if (props.guardando) return
+  if (!props.ordenAEditar) items.value.forEach(actualizarPrecio)
+  if (!props.ordenAEditar) fecha.value = obtenerFechaActual()
+  errorValidacion.value = ''
+  const productosElegidos = items.value.filter(item => item.producto_id !== 0).map(item => item.producto_id)
+  if (new Set(productosElegidos).size !== productosElegidos.length) {
+    errorValidacion.value = 'Cada producto puede aparecer una sola vez. Modificá la cantidad en su fila para pedir más unidades.'
+    return
+  }
+  if (!proveedorSeleccionado.value || !proveedorId.value || !fecha.value || !items.value.length || items.value.some(item =>
+    !productosDisponibles.value.some(producto => producto.producto_id === item.producto_id)
+    || !Number.isSafeInteger(item.cantidad) || item.cantidad <= 0 || item.cantidad > CANTIDAD_MAXIMA
+    || !importeValido(item.preciounitario) || !importeValido(subtotal(item))
+  ) || !importeValido(total.value)) {
+    errorValidacion.value = 'Revisá el proveedor y los productos. Las cantidades deben ser enteros de 1 a 2147483647 y los importes no pueden superar $9.999.999.999,99.'
+    return
+  }
+  emit('guardar', {
+    cabecera: { proveedor_id: proveedorId.value, fecha: fecha.value, total: total.value },
+    detalles: items.value.map(({ producto_id, cantidad, preciounitario }) => ({ producto_id, cantidad, preciounitario }))
+  })
+}
+
+function cerrarModal() {
+  if (!props.guardando) emit('cerrar')
+}
+
+watch(proveedorId, () => {
+  items.value = []
+  const seleccionado = proveedorSeleccionado.value
+  if (seleccionado && !items.value.length) agregarItem()
+}, { flush: 'sync' })
+
+watch(
+  () => props.mostrar,
+  (mostrar) => {
+    if (!mostrar) return
+    proveedorId.value = props.ordenAEditar?.proveedor ?? ''
+
+    busquedaProveedor.value = ''
+    fecha.value = obtenerFechaActual()
+    items.value = props.ordenAEditar?.detalles.map(d => ({ clave: siguienteClave++, busqueda: '', producto_id: d.producto_id, cantidad: d.cantidad, preciounitario: Number(d.precio_unitario) })) ?? []
+    if (props.ordenAEditar) fecha.value = props.ordenAEditar.fecha.slice(0, 10)
+    errorValidacion.value = ''
+  },
+  { immediate: true }
+)
+</script>
+
+<template>
+  <div v-if="mostrar">
+    <div class="modal-backdrop fade show"></div>
+    <div class="modal fade show d-block" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="titulo-nueva-orden" @keydown.esc="cerrarModal">
+      <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable modal-xl">
+        <form class="modal-content shadow border-0 overflow-hidden" @submit.prevent="guardar">
+          <div class="modal-header modal-header-custom text-white px-4 py-3">
+            <h5 id="titulo-nueva-orden" class="modal-title fw-bold">{{ ordenAEditar ? `Editar orden #${ordenAEditar.ordencompra_id}` : 'Nueva Orden de Compra' }}</h5>
+            <button type="button" class="btn-close btn-close-white" aria-label="Cerrar" :disabled="guardando" @click="cerrarModal"></button>
+          </div>
+          <div class="modal-body p-4 bg-white">
+            <div v-if="error || errorValidacion" class="alert alert-danger" role="alert">{{ error || errorValidacion }}</div>
+            <fieldset :disabled="guardando">
+              <legend class="fs-6 fw-bold">Cabecera</legend>
+              <div class="row g-3 mb-4">
+
+                <div class="col-md-8">
+                  <label for="buscar-proveedor" class="form-label small">Buscar proveedor</label>
+                  <input maxlength="150" v-texto-limpio
+                    id="buscar-proveedor"
+                    v-model="busquedaProveedor"
+                    type="search"
+                    class="form-control mb-2"
+                    placeholder="Buscar por nombre, CUIT o ID..."
+                    aria-describedby="resultados-proveedor"
+                    @keydown.enter.prevent
+                  />
+                  <label for="orden-proveedor" class="form-label fw-semibold">Proveedor</label>
+                  <select id="orden-proveedor" v-model="proveedorId" class="form-select" required>
+                    <option disabled value="">Seleccionar proveedor</option>
+                    <option v-if="proveedorFueraDelFiltro" :value="proveedorFueraDelFiltro.proveedor_id" hidden>
+                      {{ proveedorFueraDelFiltro.nombre }} {{ proveedorFueraDelFiltro.apellido }} — {{ proveedorFueraDelFiltro.cuit }}
+                    </option>
+                    <option v-for="proveedor in proveedoresFiltrados" :key="proveedor.proveedor_id" :value="proveedor.proveedor_id">
+                      {{ proveedor.nombre }} {{ proveedor.apellido }} — {{ proveedor.cuit }}
+                    </option>
+                  </select>
+                  <small id="resultados-proveedor" class="text-muted d-block mt-1" role="status">
+                    {{ proveedoresFiltrados.length === 0 ? 'No se encontraron proveedores.' : `${proveedoresFiltrados.length} proveedor(es) disponibles.` }}
+                  </small>
+                </div>
+                <div class="col-md-4">
+                  <label for="orden-fecha" class="form-label fw-semibold">Fecha</label>
+                  <input id="orden-fecha" :value="fecha" type="date" class="form-control" readonly aria-describedby="orden-fecha-ayuda" />
+                  <small id="orden-fecha-ayuda" class="text-muted">Se asigna automáticamente el día de creación.</small>
+                </div>
+              </div>
+              <p v-if="!proveedorSeleccionado" id="productos-bloqueados" class="alert alert-info" role="status">
+                Seleccioná un proveedor para agregar productos a la orden.
+              </p>
+              <p v-if="proveedorSeleccionado && !productosDisponibles.length" class="alert alert-info">Este proveedor no tiene productos disponibles en el catálogo.</p><fieldset :disabled="!proveedorSeleccionado" :aria-describedby="!proveedorSeleccionado ? 'productos-bloqueados' : undefined">
+              <div class="d-flex justify-content-between align-items-center gap-2 mb-3">
+                <h6 class="fw-bold mb-0">Detalle de productos</h6>
+                <button type="button" class="btn btn-sm btn-outline-coralon" :disabled="items.length >= productosDisponibles.length" @click="agregarItem">Agregar producto</button>
+              </div>
+              <div v-for="(item, index) in items" :key="item.clave" class="row g-2 align-items-end border rounded p-2 mb-3">
+                <div class="col-md-4">
+                  <label :for="`buscar-producto-${item.clave}`" class="form-label small">Buscar producto</label>
+                  <input maxlength="150" v-texto-limpio
+                    :id="`buscar-producto-${item.clave}`"
+                    v-model="item.busqueda"
+                    type="search"
+                    class="form-control mb-2"
+                    placeholder="Buscar por nombre o ID..."
+                    :aria-label="`Buscar producto para el ítem ${index + 1}`"
+                    :aria-describedby="`resultados-producto-${item.clave}`"
+                    @keydown.enter.prevent
+                  />
+                  <label :for="`producto-${item.clave}`" class="form-label small">Producto {{ index + 1 }}</label>
+                  <select :id="`producto-${item.clave}`" v-model="item.producto_id" class="form-select" required @change="actualizarPrecio(item)">
+                    <option disabled :value="0">Seleccionar producto</option>
+                    <option
+                      v-if="productosPorItem[index]?.seleccionadoFueraDelFiltro"
+                      :value="item.producto_id"
+                      hidden
+                    >{{ productosPorItem[index]?.seleccionadoFueraDelFiltro?.nombre }}</option>
+                    <option v-for="producto in productosPorItem[index]?.coincidencias" :key="producto.producto_id" :value="producto.producto_id">#{{ producto.producto_id }} — {{ producto.nombre }}</option>
+                  </select>
+                  <small :id="`resultados-producto-${item.clave}`" class="text-muted d-block mt-1" role="status">
+                    {{ productosPorItem[index]?.coincidencias.length === 0 ? 'No se encontraron productos.' : `${productosPorItem[index]?.coincidencias.length} producto(s) disponibles.` }}
+                  </small>
+                </div>
+                <div class="col-md-2">
+                  <label :for="`cantidad-${item.clave}`" class="form-label small">Cantidad</label>
+                  <input
+                    :id="`cantidad-${item.clave}`"
+                    :value="item.cantidad || ''"
+                    type="text"
+                    inputmode="numeric" maxlength="10"
+                    pattern="[0-9]*[1-9][0-9]*"
+                    title="Ingresá una cantidad entera mayor a cero."
+                    required
+                    class="form-control"
+                    @beforeinput="bloquearCantidadNoEntera"
+                    @paste="validarPegadoCantidad"
+                    @input="actualizarCantidad($event, item)"
+                  />
+                </div>
+                <div class="col-md-2">
+                  <label :for="`precio-${item.clave}`" class="form-label small">Precio unitario</label>
+                  <input :id="`precio-${item.clave}`" :value="Number.isFinite(item.preciounitario) ? moneda(item.preciounitario) : 'Sin precio de compra'" type="text" readonly class="form-control bg-light" />
+                </div>
+                <div class="col-md-3">
+                  <span class="small d-block mb-2">Subtotal</span>
+                  <span class="d-block py-2 fw-semibold">{{ moneda(subtotal(item)) }}</span>
+                </div>
+                <div class="col-md-1">
+                  <button type="button" class="btn btn-outline-danger w-100" :aria-label="`Quitar producto ${index + 1}`" @click="items.splice(index, 1)">×</button>
+                </div>
+              </div>
+              </fieldset>
+            </fieldset>
+            <p class="text-end fs-5 fw-bold mb-0">Total: <span class="text-coralon">{{ moneda(total) }}</span></p>
+          </div>
+          <div class="modal-footer bg-light px-4 py-3">
+            <button type="button" class="btn btn-secondary px-3" :disabled="guardando" @click="cerrarModal">Cerrar</button>
+            <button type="submit" class="btn btn-coralon fw-semibold" :disabled="guardando || !proveedorSeleccionado || !items.length">
+              {{ guardando ? 'Guardando…' : ordenAEditar ? 'Guardar cambios' : 'Guardar Orden' }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.modal-backdrop { opacity: 0.6; }
+.modal-header-custom { background-color: #231f1d; border-bottom: 3px solid #b33e14; }
+.text-coralon { color: #b33e14; }
+.btn-coralon { background-color: #b33e14; border-color: #b33e14; color: #fff; }
+.btn-coralon:hover { background-color: #ff7a45; border-color: #ff7a45; }
+.btn-outline-coralon { border-color: #b33e14; color: #b33e14; }
+.btn-outline-coralon:hover { background-color: #b33e14; color: #fff; }
+</style>
